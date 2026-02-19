@@ -229,24 +229,40 @@ def build_findings_from_dict(report_findings: [dict]) -> [Finding]:
                 finding.cvssv3_score = cvss_data.get("cvssv3_score")
 
             # Qualys reports regression findings as active, but with a Date Last
-            # Fixed.
-            if report_finding["Date Last Fixed"]:
-                finding.mitigated = datetime.strptime(
-                    report_finding["Date Last Fixed"], "%m/%d/%Y %H:%M:%S",
-                )
+            # Fixed. v3 csv_extended exports may omit these columns entirely.
+            vuln_status = report_finding.get("Vuln Status", "Active")
+            date_last_fixed_str = report_finding.get("Date Last Fixed", "")
+
+            if vuln_status == "Fixed":
+                finding.active = False
                 finding.is_mitigated = True
+                if date_last_fixed_str:
+                    try:
+                        finding.mitigated = datetime.strptime(
+                            date_last_fixed_str, "%m/%d/%Y %H:%M:%S",
+                        )
+                    except ValueError:
+                        finding.mitigated = None
+                else:
+                    finding.mitigated = None
             else:
-                finding.is_mitigated = False
+                if date_last_fixed_str:
+                    finding.mitigated = datetime.strptime(
+                        date_last_fixed_str, "%m/%d/%Y %H:%M:%S",
+                    )
+                    finding.is_mitigated = True
+                else:
+                    finding.is_mitigated = False
 
-            finding.active = report_finding["Vuln Status"] in {
-                "Active",
-                "Re-Opened",
-                "New",
-            }
+                finding.active = vuln_status in {
+                    "Active",
+                    "Re-Opened",
+                    "New",
+                }
 
-            if finding.active:
-                finding.mitigated = None
-                finding.is_mitigated = False
+                if finding.active:
+                    finding.mitigated = None
+                    finding.is_mitigated = False
         elif report_finding.get("VULN TITLE"):
             # Get the date based on the first_seen setting
             try:
@@ -274,7 +290,7 @@ def build_findings_from_dict(report_findings: [dict]) -> [Finding]:
         else:
             # Set the initial cve list for new findings
             finding.unsaved_vulnerability_ids = cve_list
-        finding.verified = True
+        finding.verified = report_finding.get("Type") == "Vuln"
         if settings.V3_FEATURE_LOCATIONS:
             if report_finding.get("FQDN"):
                 location = URL.from_value(report_finding.get("FQDN"))

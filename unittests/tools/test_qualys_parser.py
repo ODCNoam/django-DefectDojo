@@ -223,6 +223,54 @@ class TestQualysParser(DojoTestCase):
 
             self.assertEqual(expected_counts, counts)
 
+    def test_csv_vuln_type_yields_verified_true(self):
+        with (
+            get_unit_tests_scans_path("qualys") / "qualys_v3_types_and_fixed.csv").open(encoding="utf-8",
+        ) as testfile:
+            parser = QualysParser()
+            findings = parser.get_findings(testfile, Test())
+            self.validate_locations(findings)
+            self.assertEqual(3, len(findings))
+            vuln_finding = next(f for f in findings if f.vuln_id_from_tool == "100001")
+            self.assertTrue(vuln_finding.verified)
+
+    def test_csv_practice_type_yields_verified_false(self):
+        with (
+            get_unit_tests_scans_path("qualys") / "qualys_v3_types_and_fixed.csv").open(encoding="utf-8",
+        ) as testfile:
+            parser = QualysParser()
+            findings = parser.get_findings(testfile, Test())
+            self.validate_locations(findings)
+            practice_finding = next(f for f in findings if f.vuln_id_from_tool == "100002")
+            self.assertFalse(practice_finding.verified)
+
+    def test_csv_fixed_status_yields_mitigated(self):
+        with (
+            get_unit_tests_scans_path("qualys") / "qualys_v3_types_and_fixed.csv").open(encoding="utf-8",
+        ) as testfile:
+            parser = QualysParser()
+            findings = parser.get_findings(testfile, Test())
+            self.validate_locations(findings)
+            fixed_finding = next(f for f in findings if f.vuln_id_from_tool == "100003")
+            self.assertFalse(fixed_finding.active)
+            self.assertTrue(fixed_finding.is_mitigated)
+            self.assertEqual(
+                fixed_finding.mitigated,
+                datetime.datetime(2024, 1, 15, 12, 0, 0),
+            )
+
+    def test_csv_missing_status_columns_no_crash(self):
+        with (
+            get_unit_tests_scans_path("qualys") / "qualys_v3_missing_cols.csv").open(encoding="utf-8",
+        ) as testfile:
+            parser = QualysParser()
+            findings = parser.get_findings(testfile, Test())
+            self.validate_locations(findings)
+            self.assertEqual(1, len(findings))
+            finding = findings[0]
+            self.assertTrue(finding.active)
+            self.assertFalse(finding.is_mitigated)
+
     @override_settings(USE_QUALYS_LEGACY_SEVERITY_PARSING=False)
     def test_get_severity(self):
         with (get_unit_tests_scans_path("qualys") / "Qualys_Sample_Report.xml").open(encoding="utf-8") as testfile:
