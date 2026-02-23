@@ -1409,7 +1409,7 @@ HASHCODE_FIELDS_PER_SCANNER = {
     # possible improvement: in the scanner put the library name into file_path, then dedup on vulnerability_ids + file_path + severity
     "Mend Scan": ["title", "severity", "description"],
     "ZAP Scan": ["title", "cwe", "severity"],
-    "Qualys Scan": ["title", "severity", "endpoints"],
+    "Qualys Scan": ["vuln_id_from_tool", "severity"],
     # 'Qualys Webapp Scan': ['title', 'unique_id_from_tool'],
     "PHP Symfony Security Check": ["title", "vulnerability_ids"],
     "Clair Scan": ["title", "vulnerability_ids", "description", "severity"],
