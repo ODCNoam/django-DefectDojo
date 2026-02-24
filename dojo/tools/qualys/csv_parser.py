@@ -40,6 +40,7 @@ def get_fields(self) -> list[str]:
         "impact",
         "date",
         "vuln_id_from_tool",
+        "unique_id_from_tool",
         "mitigated",
         "is_mitigated",
         "active",
@@ -59,8 +60,7 @@ def get_dedupe_fields(self) -> list[str]:
     #NOTE: endpoints is not provided by parser
     """
     return [
-        "title",
-        "severity",
+        "unique_id_from_tool",
     ]
 
 
@@ -221,6 +221,7 @@ def build_findings_from_dict(report_findings: [dict]) -> [Finding]:
                 impact=report_finding["Impact"],
                 date=date,
                 vuln_id_from_tool=report_finding["QID"],
+                unique_id_from_tool=report_finding["QID"],
             )
             # Make sure vector is valid
             cvss_data = parse_cvss_data(cvssv3)
@@ -282,6 +283,7 @@ def build_findings_from_dict(report_findings: [dict]) -> [Finding]:
                 impact=report_finding["IMPACT"],
                 date=date,
                 vuln_id_from_tool=report_finding["QID"],
+                unique_id_from_tool=report_finding["QID"],
             )
         # Make sure we have something to append to
         if isinstance(finding.unsaved_vulnerability_ids, list):

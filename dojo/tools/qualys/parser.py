@@ -328,6 +328,7 @@ def parse_finding(host, tree):
                 impact=temp["IMPACT"],
                 date=temp["date"],
                 vuln_id_from_tool=gid,
+                unique_id_from_tool=gid,
             )
 
         else:
@@ -340,6 +341,7 @@ def parse_finding(host, tree):
                 impact=temp["IMPACT"],
                 date=temp["date"],
                 vuln_id_from_tool=gid,
+                unique_id_from_tool=gid,
             )
         finding.mitigated = temp["mitigation_date"]
         finding.is_mitigated = temp["mitigated"]
