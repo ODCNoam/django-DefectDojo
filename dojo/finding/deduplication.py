@@ -131,7 +131,6 @@ def set_duplicate(new_finding, existing_finding):
 
     deduplicationLogger.debug("Setting new finding " + str(new_finding.id) + " as a duplicate of existing finding " + str(existing_finding.id))
     new_finding.duplicate = True
-    new_finding.active = False
     new_finding.verified = False
     new_finding.duplicate_finding = existing_finding
 
