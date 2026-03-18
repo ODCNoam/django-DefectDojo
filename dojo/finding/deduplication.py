@@ -8,7 +8,7 @@ from django.db.models import Prefetch
 from django.db.models.query_utils import Q
 
 from dojo.celery import app
-from dojo.models import Finding, System_Settings
+from dojo.models import Endpoint_Status, Finding, System_Settings
 
 logger = logging.getLogger(__name__)
 deduplicationLogger = logging.getLogger("dojo.specific-loggers.deduplication")
@@ -291,15 +291,26 @@ def build_candidate_scope_queryset(test, mode="deduplication", service=None):
             )
         queryset = Finding.objects.filter(scope_q)
 
-    # Base prefetches for both modes
-    prefetch_list = ["endpoints", "vulnerability_id_set", "found_by"]
+    if settings.V3_FEATURE_LOCATIONS:
+        prefetch_list = ["locations__location__url", "vulnerability_id_set", "found_by"]
+    else:
+        # TODO: Delete this after the move to Locations
+        # Base prefetches for both modes
+        prefetch_list = ["endpoints", "vulnerability_id_set", "found_by"]
 
-    # Additional prefetches for reimport mode
-    if mode == "reimport":
-        prefetch_list.extend([
-            "status_finding",
-            "status_finding__endpoint",
-        ])
+        # Additional prefetches for reimport mode: fetch only non-special endpoint statuses with their
+        # endpoint joined in, so endpoint_manager can read status_finding_non_special directly without
+        # any extra DB queries
+        if mode == "reimport":
+            prefetch_list.append(
+                Prefetch(
+                    "status_finding",
+                    queryset=Endpoint_Status.objects.exclude(
+                        Q(false_positive=True) | Q(out_of_scope=True) | Q(risk_accepted=True),
+                    ).select_related("endpoint"),
+                    to_attr="status_finding_non_special",
+                ),
+            )
 
     return (
         queryset
