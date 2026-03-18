@@ -214,14 +214,14 @@ def create_finding_group(finds, finding_group_name):
     finding_group.creator = get_current_user()
 
     if finding_group_name:
-        finding_group.name = finding_group_name
+        finding_group.name = finding_group_name[:255]
     elif finding_group.components:
-        finding_group.name = finding_group.components
+        finding_group.name = finding_group.components[:255]
     try:
         finding_group.save()
     except IntegrityError as ie:
         if "already exists" in str(ie):
-            finding_group.name = finding_group_name + finding_group_name_dummy
+            finding_group.name = finding_group_name[:255 - len(finding_group_name_dummy)] + finding_group_name_dummy
             finding_group.save()
         else:
             raise
@@ -362,7 +362,7 @@ def add_findings_to_auto_group(name, findings, group_by, *, create_finding_group
 
         if create_finding_groups_for_all_findings or len(findings) > 1:
             # Only create a finding group if we have more than one finding for a given finding group, unless configured otherwise
-            finding_group, created = Finding_Group.objects.get_or_create(test=test, creator=creator, name=name)
+            finding_group, created = Finding_Group.objects.get_or_create(test=test, creator=creator, name=name[:255])
             if created:
                 logger.debug("Created Finding Group %d:%s for test %d:%s", finding_group.id, finding_group, test.id, test)
                 # See if we have old findings in the same test that were created without a finding group
@@ -388,7 +388,7 @@ def add_findings_to_auto_group(name, findings, group_by, *, create_finding_group
                 for f in old_findings:
                     f_group_name = get_group_by_group_name(f, group_by)
                     if f_group_name == name and f not in findings:
-                        finding_group, created = Finding_Group.objects.get_or_create(test=test, creator=creator, name=name)
+                        finding_group, created = Finding_Group.objects.get_or_create(test=test, creator=creator, name=name[:255])
                         finding_group.findings.add(f)
                 if created:
                     finding_group.findings.add(*findings)
@@ -765,16 +765,18 @@ def removeLoop(finding_id, counter):
         removeLoop(f.id, counter - 1)
 
 
-def add_locations(finding, form):
+def add_locations(finding, form, *, replace=False):
     # TODO: Delete this after the move to Locations
     if not settings.V3_FEATURE_LOCATIONS:
         added_endpoints = save_endpoints_to_add(form.endpoints_to_add_list, finding.test.engagement.product)
         endpoint_ids = [endpoint.id for endpoint in added_endpoints]
 
-        # Merge form endpoints with existing endpoints (don't replace)
         form_endpoints = form.cleaned_data.get("endpoints", Endpoint.objects.none())
         new_endpoints = Endpoint.objects.filter(id__in=endpoint_ids)
-        finding.endpoints.set(form_endpoints | new_endpoints | finding.endpoints.all())
+        if replace:
+            finding.endpoints.set(form_endpoints | new_endpoints)
+        else:
+            finding.endpoints.set(form_endpoints | new_endpoints | finding.endpoints.all())
 
         for endpoint in finding.endpoints.all():
             _eps, _created = Endpoint_Status.objects.get_or_create(

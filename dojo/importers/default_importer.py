@@ -110,8 +110,7 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
         # Get the findings from the parser based on what methods the parser supplies
         # This could either mean traditional file parsing, or API pull parsing
         parsed_findings = self.parse_findings(scan, parser) or []
-        # process the findings in the foreground or background
-        new_findings = self.determine_process_method(parsed_findings, **kwargs)
+        new_findings = self.process_findings(parsed_findings, **kwargs)
         # Close any old findings in the processed list if the the user specified for that
         # to occur in the form that is then passed to the kwargs
         closed_findings = self.close_old_findings(self.test.finding_set.all(), **kwargs)
@@ -244,9 +243,9 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
             # Parsers must use unsaved_tags to store tags, so we can clean them
             cleaned_tags = clean_tags(finding.unsaved_tags)
             if isinstance(cleaned_tags, list):
-                finding.tags.set(cleaned_tags)
+                finding.tags.add(*cleaned_tags)
             elif isinstance(cleaned_tags, str):
-                finding.tags.set([cleaned_tags])
+                finding.tags.add(cleaned_tags)
             # Process any files
             self.process_files(finding)
             # Process vulnerability IDs

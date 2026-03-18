@@ -5,7 +5,7 @@
 # Dockerfile.nginx to use the caching mechanism of Docker.
 
 # Ref: https://devguide.python.org/#branchstatus
-FROM python:3.13.11-slim-trixie@sha256:51e1a0a317fdb6e170dc791bbeae63fac5272c82f43958ef74a34e170c6f8b18 AS base
+FROM python:3.13.12-slim-trixie@sha256:f50f56f1471fc430b394ee75fc826be2d212e35d85ed1171ac79abbba485dce9 AS base
 FROM base AS build
 WORKDIR /app
 RUN \
@@ -44,10 +44,9 @@ RUN \
   # ugly fix to install postgresql-client without errors
   mkdir -p /usr/share/man/man1 /usr/share/man/man7 && \
   apt-get -y install --no-install-recommends \
-    # libopenjp2-7 libjpeg62 libtiff are required by the pillow package
+    # libopenjp2-7 libjpeg62 are required by the pillow package
     libopenjp2-7 \
     libjpeg62 \
-    libtiff6 \
     dnsutils \
     xmlsec1 \
     git \
