@@ -12,6 +12,7 @@ from django.conf import settings
 from django.contrib.auth.models import Group, Permission
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import transaction
 from django.db.utils import IntegrityError
 from django.urls import reverse
 from django.utils import timezone
@@ -20,13 +21,13 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound
 from rest_framework.exceptions import ValidationError as RestFrameworkValidationError
-from rest_framework.fields import DictField, MultipleChoiceField
+from rest_framework.fields import DictField
 
 import dojo.finding.helper as finding_helper
-import dojo.jira_link.helper as jira_helper
 import dojo.risk_acceptance.helper as ra_helper
 from dojo.authorization.authorization import user_has_permission
 from dojo.authorization.roles_permissions import Permissions
+from dojo.celery_dispatch import dojo_dispatch_task
 from dojo.endpoint.utils import endpoint_filter, endpoint_meta_import
 from dojo.finding.helper import (
     save_endpoints_template,
@@ -39,11 +40,10 @@ from dojo.importers.auto_create_context import AutoCreateContextManager
 from dojo.importers.base_importer import BaseImporter
 from dojo.importers.default_importer import DefaultImporter
 from dojo.importers.default_reimporter import DefaultReImporter
+from dojo.jira import services as jira_services
 from dojo.location.models import Location, LocationFindingReference
 from dojo.models import (
-    DEFAULT_NOTIFICATION,
     IMPORT_ACTIONS,
-    NOTIFICATION_CHOICES,
     SEVERITIES,
     SEVERITY_CHOICES,
     STATS_FIELDS,
@@ -74,17 +74,12 @@ from dojo.models import (
     Finding_Template,
     General_Survey,
     Global_Role,
-    JIRA_Instance,
-    JIRA_Issue,
-    JIRA_Project,
     Language_Type,
     Languages,
     Network_Locations,
     Note_Type,
     NoteHistory,
     Notes,
-    Notification_Webhooks,
-    Notifications,
     Product,
     Product_API_Scan_Configuration,
     Product_Group,
@@ -115,7 +110,7 @@ from dojo.models import (
     Vulnerability_Id,
     get_current_date,
 )
-from dojo.notifications.helper import create_notification
+from dojo.notifications.helper import async_create_notification
 from dojo.product_announcements import (
     LargeScanSizeProductAnnouncement,
     ScanTypeProductAnnouncement,
@@ -1122,6 +1117,18 @@ class EngagementSerializer(serializers.ModelSerializer):
             if data.get("target_start") > data.get("target_end"):
                 msg = "Your target start date exceeds your target end date"
                 raise serializers.ValidationError(msg)
+        if (
+            self.instance is not None
+            and "product" in data
+            and data.get("product") != self.instance.product
+            and not user_has_permission(
+                self.context["request"].user,
+                data.get("product"),
+                Permissions.Engagement_Edit,
+            )
+        ):
+            msg = "You are not permitted to edit engagements in the destination product"
+            raise PermissionDenied(msg)
         return data
 
     def build_relational_field(self, field_name, relation_info):
@@ -1363,79 +1370,11 @@ class EndpointParamsSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-class JIRAIssueSerializer(serializers.ModelSerializer):
-    url = serializers.SerializerMethodField(read_only=True)
-
-    class Meta:
-        model = JIRA_Issue
-        fields = "__all__"
-
-    def get_url(self, obj) -> str:
-        return jira_helper.get_jira_issue_url(obj)
-
-    def validate(self, data):
-        if self.context["request"].method == "PATCH":
-            engagement = data.get("engagement", self.instance.engagement)
-            finding = data.get("finding", self.instance.finding)
-            finding_group = data.get(
-                "finding_group", self.instance.finding_group,
-            )
-        else:
-            engagement = data.get("engagement", None)
-            finding = data.get("finding", None)
-            finding_group = data.get("finding_group", None)
-
-        if (
-            (engagement and not finding and not finding_group)
-            or (finding and not engagement and not finding_group)
-            or (finding_group and not engagement and not finding)
-        ):
-            pass
-        else:
-            msg = "Either engagement or finding or finding_group has to be set."
-            raise serializers.ValidationError(msg)
-
-        if finding:
-            if (linked_finding := jira_helper.jira_already_linked(finding, data.get("jira_key"), data.get("jira_id"))) is not None:
-                msg = "JIRA issue " + data.get("jira_key") + " already linked to " + reverse("view_finding", args=(linked_finding.id,))
-                raise serializers.ValidationError(msg)
-
-        return data
-
-
-class JIRAInstanceSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = JIRA_Instance
-        fields = "__all__"
-        extra_kwargs = {
-            "password": {"write_only": True},
-        }
-
-
-class JIRAProjectSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = JIRA_Project
-        fields = "__all__"
-
-    def validate(self, data):
-        if self.context["request"].method == "PATCH":
-            engagement = data.get("engagement", self.instance.engagement)
-            product = data.get("product", self.instance.product)
-        else:
-            engagement = data.get("engagement", None)
-            product = data.get("product", None)
-
-        if (engagement and product) or (not engagement and not product):
-            msg = "Either engagement or product has to be set."
-            raise serializers.ValidationError(msg)
-
-        if "custom_fields" in data and isinstance(data["custom_fields"], str):
-            try:
-                data["custom_fields"] = json.loads(data["custom_fields"])
-            except json.JSONDecodeError as e:
-                raise serializers.ValidationError({"custom_fields": f"Invalid JSON: {e}"}) from e
-
-        return data
+from dojo.jira.api.serializers import (  # noqa: E402, F401 backward compat
+    JIRAInstanceSerializer,
+    JIRAIssueSerializer,
+    JIRAProjectSerializer,
+)
 
 
 class SonarqubeIssueSerializer(serializers.ModelSerializer):
@@ -1757,7 +1696,7 @@ class FindingRelatedFieldsSerializer(serializers.Serializer):
 
     @extend_schema_field(JIRAIssueSerializer)
     def get_jira(self, obj):
-        issue = jira_helper.get_jira_issue(obj)
+        issue = jira_services.get_issue(obj)
         if issue is None:
             return None
         return JIRAIssueSerializer(read_only=True).to_representation(issue)
@@ -1831,11 +1770,11 @@ class FindingSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.DateTimeField())
     def get_jira_creation(self, obj):
-        return jira_helper.get_jira_creation(obj)
+        return jira_services.get_creation(obj)
 
     @extend_schema_field(serializers.DateTimeField())
     def get_jira_change(self, obj):
-        return jira_helper.get_jira_change(obj)
+        return jira_services.get_change(obj)
 
     @extend_schema_field(FindingRelatedFieldsSerializer)
     def get_related_fields(self, obj):
@@ -1911,9 +1850,9 @@ class FindingSerializer(serializers.ModelSerializer):
             for location_ref in locations:
                 location_ref.location.associate_with_finding(instance)
 
-        if push_to_jira or finding_helper.is_keep_in_sync_with_jira(instance):
+        if push_to_jira or jira_services.is_keep_in_sync(instance):
             # Push synchronously so that we can see jira errors in real time
-            success, message = jira_helper.push_to_jira(instance, sync=True)
+            success, message = jira_services.push(instance, sync=True)
             if not success:
                 raise serializers.ValidationError(message)
 
@@ -2070,13 +2009,14 @@ class FindingCreateSerializer(serializers.ModelSerializer):
             save_vulnerability_ids(new_finding, parsed_vulnerability_ids)
 
         if push_to_jira:
-            jira_helper.push_to_jira(new_finding)
+            jira_services.push(new_finding)
 
         # Create a notification
-        create_notification(
+        dojo_dispatch_task(
+            async_create_notification,
             event="finding_added",
             title=_("Addition of %s") % new_finding.title,
-            finding=new_finding,
+            finding_id=new_finding.id,
             description=_('Finding "%s" was added by %s') % (new_finding.title, new_finding.reporter),
             url=reverse("view_finding", args=(new_finding.id,)),
             icon="exclamation-triangle",
@@ -2880,29 +2820,28 @@ class ImportLanguagesSerializer(serializers.Serializer):
                 deserialized = json.loads(data)
         except Exception:
             msg = "Invalid format"
-            raise Exception(msg)
+            raise serializers.ValidationError(msg)
 
-        # Filter out ignored keys
-        language_names = [name for name in deserialized if name not in {"header", "SUM"}]
-        # Prepopulate existing Language_Type objects
-        existing_types = {
+        # Filter out ignored keys and deduplicate
+        language_names = list(dict.fromkeys(
+            name for name in deserialized if name not in {"header", "SUM"}
+        ))
+        # Ensure any new Language_Type records exist (ignore conflicts from
+        # concurrent requests or already-existing types)
+        Language_Type.objects.bulk_create(
+            [Language_Type(language=name) for name in language_names],
+            ignore_conflicts=True,
+        )
+        # Single query to fetch all Language_Type objects we need (indexed lookup)
+        language_types = {
             lt.language: lt
             for lt in Language_Type.objects.filter(language__in=language_names)
         }
-        # Determine which Language_Type objects need to be created
-        new_language_names = [name for name in language_names if name not in existing_types]
-        new_types = [Language_Type(language=name) for name in new_language_names]
-        Language_Type.objects.bulk_create(new_types)
-        # Add newly created Language_Type objects to cache
-        for lt in Language_Type.objects.filter(language__in=new_language_names):
-            existing_types[lt.language] = lt
-        # Delete all Languages for this product
-        Languages.objects.filter(product=product).delete()
-        # Prepare Languages objects for bulk insert
-        languages_to_create = [
+        # Prepare Languages objects for upsert
+        languages_to_upsert = [
             Languages(
                 product=product,
-                language=existing_types[name],
+                language=language_types[name],
                 files=deserialized[name].get("nFiles", 0),
                 blank=deserialized[name].get("blank", 0),
                 comment=deserialized[name].get("comment", 0),
@@ -2910,8 +2849,22 @@ class ImportLanguagesSerializer(serializers.Serializer):
             )
             for name in language_names
         ]
-        # Bulk insert all Languages in one query
-        Languages.objects.bulk_create(languages_to_create)
+        # Upsert Languages and remove stale ones atomically
+        try:
+            with transaction.atomic():
+                Languages.objects.bulk_create(
+                    languages_to_upsert,
+                    update_conflicts=True,
+                    unique_fields=["language", "product"],
+                    update_fields=["files", "blank", "comment", "code"],
+                )
+                # Remove languages no longer present in the file
+                Languages.objects.filter(product=product).exclude(
+                    language__in=language_types.values(),
+                ).delete()
+        except IntegrityError as e:
+            msg = f"Failed to import languages due to a data integrity issue: {e}"
+            raise serializers.ValidationError(msg)
 
     def validate(self, data):
         if is_scan_file_too_large(data["file"]):
@@ -3008,6 +2961,11 @@ class FindingCloseSerializer(serializers.ModelSerializer):
         return data
 
 
+class FindingVerifySerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
+    note_type = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=Note_Type.objects.all())
+
+
 class ReportGenerateOptionSerializer(serializers.Serializer):
     include_finding_notes = serializers.BooleanField(default=False)
     include_finding_images = serializers.BooleanField(default=False)
@@ -3050,9 +3008,9 @@ class ReportGenerateSerializer(serializers.Serializer):
     )
 
 
-class EngagementUpdateJiraEpicSerializer(serializers.Serializer):
-    epic_name = serializers.CharField(required=False, max_length=200)
-    epic_priority = serializers.CharField(required=False, allow_null=True)
+from dojo.jira.api.serializers import (  # noqa: E402, F401 backward compat
+    EngagementUpdateJiraEpicSerializer,
+)
 
 
 class TagSerializer(serializers.Serializer):
@@ -3083,114 +3041,31 @@ class SystemSettingsSerializer(serializers.ModelSerializer):
         return data
 
 
+class CeleryStatusSerializer(serializers.Serializer):
+    worker_status = serializers.BooleanField(read_only=True)
+    broker_status = serializers.BooleanField(read_only=True)
+    queue_length = serializers.IntegerField(allow_null=True, read_only=True)
+    task_time_limit = serializers.IntegerField(allow_null=True, read_only=True)
+    task_soft_time_limit = serializers.IntegerField(allow_null=True, read_only=True)
+    task_default_expires = serializers.IntegerField(allow_null=True, read_only=True)
+
+
+class CeleryQueueTaskDetailSerializer(serializers.Serializer):
+    task_name = serializers.CharField(read_only=True)
+    count = serializers.IntegerField(read_only=True)
+    oldest_position = serializers.IntegerField(read_only=True)
+    newest_position = serializers.IntegerField(read_only=True)
+    oldest_eta = serializers.CharField(allow_null=True, read_only=True)
+    newest_eta = serializers.CharField(allow_null=True, read_only=True)
+    earliest_expires = serializers.CharField(allow_null=True, read_only=True)
+    latest_expires = serializers.CharField(allow_null=True, read_only=True)
+
+
 class FindingNoteSerializer(serializers.Serializer):
     note_id = serializers.IntegerField()
 
 
-class NotificationsSerializer(serializers.ModelSerializer):
-    product = serializers.PrimaryKeyRelatedField(
-        queryset=Product.objects.all(),
-        required=False,
-        default=None,
-        allow_null=True,
-    )
-    user = serializers.PrimaryKeyRelatedField(
-        queryset=Dojo_User.objects.all(),
-        required=False,
-        default=None,
-        allow_null=True,
-    )
-    product_type_added = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    product_added = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    engagement_added = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    test_added = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    scan_added = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    jira_update = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    upcoming_engagement = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    stale_engagement = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    auto_close_engagement = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    close_engagement = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    user_mentioned = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    code_review = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    review_requested = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    other = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    sla_breach = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    sla_breach_combined = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    risk_acceptance_expiration = MultipleChoiceField(
-        choices=NOTIFICATION_CHOICES, default=DEFAULT_NOTIFICATION,
-    )
-    template = serializers.BooleanField(default=False)
-
-    class Meta:
-        model = Notifications
-        fields = "__all__"
-
-    def validate(self, data):
-        user = None
-        product = None
-        template = False
-
-        if self.instance is not None:
-            user = self.instance.user
-            product = self.instance.product
-
-        if "user" in data:
-            user = data.get("user")
-        if "product" in data:
-            product = data.get("product")
-        if "template" in data:
-            template = data.get("template")
-
-        if (
-            template
-            and Notifications.objects.filter(template=True).count() > 0
-        ):
-            msg = "Notification template already exists"
-            raise ValidationError(msg)
-        if (
-            self.instance is None
-            or user != self.instance.user
-            or product != self.instance.product
-        ):
-            notifications = Notifications.objects.filter(
-                user=user, product=product, template=template,
-            ).count()
-            if notifications > 0:
-                msg = "Notification for user and product already exists"
-                raise ValidationError(msg)
-        return data
+from dojo.notifications.api.serializer import NotificationsSerializer  # noqa: E402, F401  -- backward compat
 
 
 class EngagementPresetsSerializer(serializers.ModelSerializer):
@@ -3367,7 +3242,4 @@ class AnnouncementSerializer(serializers.ModelSerializer):
             raise
 
 
-class NotificationWebhooksSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Notification_Webhooks
-        fields = "__all__"
+from dojo.notifications.api.serializer import NotificationWebhooksSerializer  # noqa: E402, F401  -- backward compat

@@ -455,6 +455,23 @@ class UserHasFindingNotePermission(BaseRelatedObjectPermission):
     }
 
 
+class UserHasBurpRawRequestResponsePermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return check_post_permission(
+            request, Finding, "finding", Permissions.Finding_Edit,
+        )
+
+    def has_object_permission(self, request, view, obj):
+        return check_object_permission(
+            request,
+            obj.finding,
+            Permissions.Finding_View,
+            Permissions.Finding_Edit,
+            Permissions.Finding_Edit,
+            Permissions.Finding_Edit,
+        )
+
+
 class UserHasImportPermission(permissions.BasePermission):
     def has_permission(self, request, view):
         # permission check takes place before validation, so we don't have access to serializer.validated_data()
@@ -473,7 +490,13 @@ class UserHasImportPermission(permissions.BasePermission):
             # Raise an explicit drf exception here
             raise ValidationError(e)
         if engagement := converted_dict.get("engagement"):
-            # existing engagement, nothing special to check
+            # Validate the resolved engagement's parent chain matches any provided identifiers
+            if (product := converted_dict.get("product")) and engagement.product_id != product.id:
+                msg = "The provided identifiers are inconsistent — the engagement does not belong to the specified product."
+                raise ValidationError(msg)
+            if (engagement_name := converted_dict.get("engagement_name")) and engagement.name != engagement_name:
+                msg = "The provided identifiers are inconsistent — the engagement name does not match the specified engagement."
+                raise ValidationError(msg)
             return user_has_permission(
                 request.user, engagement, Permissions.Import_Scan_Result,
             )
@@ -764,6 +787,11 @@ class UserHasReimportPermission(permissions.BasePermission):
         try:
             converted_dict = auto_create.convert_querydict_to_dict(request.data)
             auto_create.process_import_meta_data_from_dict(converted_dict)
+            # engagement is not a declared field on ReImportScanSerializer and will be
+            # stripped during validation — don't use it in the permission check either,
+            # so the permission check resolves targets the same way execution does
+            converted_dict.pop("engagement", None)
+            converted_dict.pop("engagement_id", None)
             # Get an existing product
             converted_dict["product_type"] = auto_create.get_target_product_type_if_exists(**converted_dict)
             converted_dict["product"] = auto_create.get_target_product_if_exists(**converted_dict)
@@ -774,7 +802,20 @@ class UserHasReimportPermission(permissions.BasePermission):
             raise ValidationError(e)
 
         if test := converted_dict.get("test"):
-            # existing test, nothing special to check
+            # Validate the resolved test's parent chain matches any provided identifiers
+            if (product := converted_dict.get("product")) and test.engagement.product_id != product.id:
+                msg = "The provided identifiers are inconsistent — the test does not belong to the specified product."
+                raise ValidationError(msg)
+            if (engagement := converted_dict.get("engagement")) and test.engagement_id != engagement.id:
+                msg = "The provided identifiers are inconsistent — the test does not belong to the specified engagement."
+                raise ValidationError(msg)
+            # Also validate by name when the objects were not resolved (e.g. names that match no existing record)
+            if not converted_dict.get("product") and (product_name := converted_dict.get("product_name")) and test.engagement.product.name != product_name:
+                msg = "The provided identifiers are inconsistent — the test does not belong to the specified product."
+                raise ValidationError(msg)
+            if not converted_dict.get("engagement") and (engagement_name := converted_dict.get("engagement_name")) and test.engagement.name != engagement_name:
+                msg = "The provided identifiers are inconsistent — the test does not belong to the specified engagement."
+                raise ValidationError(msg)
             return user_has_permission(
                 request.user, test, Permissions.Import_Scan_Result,
             )
@@ -1181,7 +1222,10 @@ def check_auto_create_permission(
         raise ValidationError(msg)
 
     if engagement:
-        # existing engagement, nothing special to check
+        # Validate the resolved engagement's parent chain matches any provided names
+        if product is not None and engagement.product_id != product.id:
+            msg = "The provided identifiers are inconsistent — the engagement does not belong to the specified product."
+            raise ValidationError(msg)
         return user_has_permission(
             user, engagement, Permissions.Import_Scan_Result,
         )

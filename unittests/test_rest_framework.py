@@ -60,8 +60,6 @@ from dojo.api_v2.views import (
     LanguageViewSet,
     NotesViewSet,
     NoteTypeViewSet,
-    NotificationsViewSet,
-    NotificationWebhooksViewSet,
     ProductAPIScanConfigurationViewSet,
     ProductGroupViewSet,
     ProductMemberViewSet,
@@ -149,6 +147,7 @@ from dojo.models import (
     User,
     UserContactInfo,
 )
+from dojo.notifications.api.views import NotificationsViewSet, NotificationWebhooksViewSet
 from dojo.organization.api.views import (
     OrganizationGroupViewSet,
     OrganizationMemberViewSet,
@@ -1002,8 +1001,8 @@ class FindingCloseAPITest(DojoAPITestCase):
 
     def test_close_finding_pushes_note_to_jira_when_configured(self):
         finding = Finding.objects.get(id=7)
-        with patch("dojo.jira_link.helper.add_comment") as add_comment_mock, \
-             patch("dojo.jira_link.helper.is_push_all_issues", return_value=True), \
+        with patch("dojo.jira.helper.add_comment") as add_comment_mock, \
+             patch("dojo.jira.helper.is_push_all_issues", return_value=True), \
              patch.object(Finding, "has_jira_issue", new_callable=PropertyMock, return_value=True):
             payload = {
                 "is_mitigated": True,
@@ -1011,7 +1010,38 @@ class FindingCloseAPITest(DojoAPITestCase):
             }
             response = self.client.post(self._close_url(finding.id), payload, format="json")
             self.assertEqual(200, response.status_code, response.content[:1000])
-            self.assertTrue(add_comment_mock.called)
+        self.assertTrue(add_comment_mock.called)
+
+
+@versioned_fixtures
+class FindingVerifyAPITest(DojoAPITestCase):
+    fixtures = ["dojo_testdata.json"]
+
+    def setUp(self):
+        testuser = User.objects.get(username="admin")
+        token = Token.objects.get(user=testuser)
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+        self.admin = testuser
+
+    def _verify_url(self, finding_id: int) -> str:
+        return f"/api/v2/findings/{finding_id}/verify/"
+
+    def test_verify_finding_basic(self):
+        finding = Finding.objects.get(id=7)
+        response = self.client.post(self._verify_url(finding.id), {"note": "Marked verified"}, format="json")
+        self.assertEqual(200, response.status_code, response.content[:1000])
+
+        finding.refresh_from_db()
+        self.assertTrue(finding.verified)
+        self.assertEqual(finding.last_reviewed_by, self.admin)
+        self.assertTrue(finding.notes.filter(entry__icontains="Marked verified").exists())
+
+    def test_verify_finding_invalid_payload(self):
+        finding = Finding.objects.get(id=7)
+        # note_type specified but invalid id
+        response = self.client.post(self._verify_url(finding.id), {"note_type": 9999}, format="json")
+        self.assertEqual(400, response.status_code, response.content[:1000])
 
 
 @versioned_fixtures
@@ -1612,6 +1642,19 @@ class URLTest(BaseClass.BaseClassTest):
         response = self.client.put(relative_url, self.payload)
         self.assertEqual(403, response.status_code, response.content[:1000])
 
+    def test_delete_removes_location(self):
+        """Verify that deleting a URL via the API also deletes the associated Location."""
+        url_obj = URL.objects.get(pk=self.delete_id)
+        location_id = url_obj.location_id
+        self.assertTrue(Location.objects.filter(pk=location_id).exists())
+
+        relative_url = f"{self.url}{location_id}/"
+        response = self.client.delete(relative_url)
+        self.assertEqual(204, response.status_code, response.content[:1000])
+
+        self.assertFalse(Location.objects.filter(pk=location_id).exists())
+        self.assertFalse(URL.objects.filter(pk=self.delete_id).exists())
+
 
 @versioned_fixtures
 class EngagementTest(BaseClass.RelatedObjectsTest, BaseClass.BaseClassTest):
@@ -1743,6 +1786,131 @@ class FindingRequestResponseTest(DojoAPITestCase):
         # print('response.data:')
         # print(response.data)
         self.assertEqual(200, response.status_code, response.content[:1000])
+
+
+@versioned_fixtures
+class RequestResponsePairsAuthzTest(DojoAPITestCase):
+
+    fixtures = ["dojo_testdata.json"]
+
+    def _client_for(self, username):
+        user = User.objects.get(username=username)
+        token = Token.objects.get(user=user)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+        return client
+
+    def test_admin_can_create_request_response_pair_positive_control(self):
+        client = self._client_for("admin")
+        before = BurpRawRequestResponse.objects.filter(finding_id=7).count()
+        response = client.post(
+            "/api/v2/request_response_pairs/",
+            dumps({
+                "finding": 7,
+                "burpRequestBase64": "cmVxdWVzdAo=",
+                "burpResponseBase64": "cmVzcG9uc2UK",
+            }),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 201, response.content[:1000])
+        self.assertEqual(BurpRawRequestResponse.objects.filter(finding_id=7).count(), before + 1)
+
+    def test_unrelated_user_cannot_create_request_response_pair_on_hidden_finding(self):
+        client = self._client_for("user2")
+        # Sanity: the victim finding is genuinely hidden from this user.
+        get_response = client.get("/api/v2/findings/7/")
+        self.assertEqual(get_response.status_code, 404)
+
+        before = BurpRawRequestResponse.objects.filter(finding_id=7).count()
+        response = client.post(
+            "/api/v2/request_response_pairs/",
+            dumps({
+                "finding": 7,
+                "burpRequestBase64": "cmVxdWVzdAo=",
+                "burpResponseBase64": "cmVzcG9uc2UK",
+            }),
+            content_type="application/json",
+        )
+        self.assertIn(response.status_code, (403, 404), response.content[:1000])
+        self.assertEqual(BurpRawRequestResponse.objects.filter(finding_id=7).count(), before)
+
+    def test_post_without_finding_returns_4xx(self):
+        client = self._client_for("user2")
+        response = client.post(
+            "/api/v2/request_response_pairs/",
+            dumps({
+                "burpRequestBase64": "cmVxdWVzdAo=",
+                "burpResponseBase64": "cmVzcG9uc2UK",
+            }),
+            content_type="application/json",
+        )
+        # check_post_permission raises ParseError (400) when "finding" is omitted.
+        self.assertGreaterEqual(response.status_code, 400)
+        self.assertLess(response.status_code, 500)
+
+
+@versioned_fixtures
+class FindingActionAuthzTest(DojoAPITestCase):
+
+    fixtures = ["dojo_testdata.json"]
+
+    def _client_for(self, username):
+        user = User.objects.get(username=username)
+        token = Token.objects.get(user=user)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+        return client
+
+    def test_admin_can_reset_finding_duplicate_status(self):
+        client = self._client_for("admin")
+        # Mark finding 2 as a duplicate of finding 3 first, then reset.
+        set_response = client.post("/api/v2/findings/2/original/3/")
+        self.assertEqual(set_response.status_code, status.HTTP_204_NO_CONTENT, set_response.content[:500])
+        reset_response = client.post("/api/v2/findings/2/duplicate/reset/")
+        self.assertEqual(reset_response.status_code, status.HTTP_204_NO_CONTENT, reset_response.content[:500])
+        refreshed = Finding.objects.get(pk=2)
+        self.assertFalse(refreshed.duplicate)
+        self.assertIsNone(refreshed.duplicate_finding)
+
+    def test_admin_can_set_finding_as_original(self):
+        client = self._client_for("admin")
+        response = client.post("/api/v2/findings/2/original/3/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.content[:500])
+        refreshed = Finding.objects.get(pk=2)
+        self.assertTrue(refreshed.duplicate)
+        self.assertEqual(refreshed.duplicate_finding_id, 3)
+
+    def test_unrelated_user_cannot_reset_finding_duplicate_status(self):
+        client = self._client_for("user2")
+        # Sanity: finding 7 is not visible to this user.
+        self.assertEqual(client.get("/api/v2/findings/7/").status_code, 404)
+
+        before = Finding.objects.get(pk=7)
+        before_duplicate = before.duplicate
+        before_duplicate_finding_id = before.duplicate_finding_id
+
+        response = client.post("/api/v2/findings/7/duplicate/reset/")
+        self.assertIn(response.status_code, (403, 404), response.content[:500])
+
+        after = Finding.objects.get(pk=7)
+        self.assertEqual(after.duplicate, before_duplicate)
+        self.assertEqual(after.duplicate_finding_id, before_duplicate_finding_id)
+
+    def test_unrelated_user_cannot_set_finding_as_original(self):
+        client = self._client_for("user2")
+        # Sanity: finding 7 is not visible to this user.
+        self.assertEqual(client.get("/api/v2/findings/7/").status_code, 404)
+
+        before = Finding.objects.get(pk=7)
+        before_duplicate = before.duplicate
+        before_duplicate_finding_id = before.duplicate_finding_id
+
+        response = client.post("/api/v2/findings/7/original/2/")
+        self.assertIn(response.status_code, (403, 404), response.content[:500])
+
+        after = Finding.objects.get(pk=7)
+        self.assertEqual(after.duplicate, before_duplicate)
+        self.assertEqual(after.duplicate_finding_id, before_duplicate_finding_id)
 
 
 @versioned_fixtures
@@ -2674,7 +2842,7 @@ class UsersTest(BaseClass.BaseClassTest):
         }
         self.update_fields = {"first_name": "test changed", "configuration_permissions": [219, 220]}
         self.test_type = TestType.CONFIGURATION_PERMISSIONS
-        self.deleted_objects = 25
+        self.deleted_objects = 13
         BaseClass.RESTEndpointTest.__init__(self, *args, **kwargs)
 
     def test_create(self):
@@ -3385,6 +3553,95 @@ class ReimportScanTest(DojoAPITestCase):
             importer_mock.assert_not_called()
             reimporter_mock.assert_not_called()
 
+    # Security tests: verify that conflicting ID-based and name-based identifiers are rejected
+
+    @patch("dojo.importers.default_reimporter.DefaultReImporter.process_scan")
+    @patch("dojo.importers.default_importer.DefaultImporter.process_scan")
+    @patch("dojo.api_v2.permissions.user_has_permission")
+    def test_reimport_engagement_param_ignored_permission_checked_on_name_resolved_target(self, mock, importer_mock, reimporter_mock):
+        """
+        Engagement is not a declared field on ReImportScanSerializer — verify
+        the permission check uses the name-resolved target, not the engagement param.
+        """
+        mock.return_value = False
+        importer_mock.return_value = IMPORTER_MOCK_RETURN_VALUE
+        reimporter_mock.return_value = REIMPORTER_MOCK_RETURN_VALUE
+
+        with Path("tests/zap_sample.xml").open(encoding="utf-8") as testfile:
+            payload = {
+                "minimum_severity": "Low",
+                "active": True,
+                "verified": True,
+                "scan_type": "ZAP Scan",
+                "file": testfile,
+                # engagement=1 belongs to Product 2 Engagement 1, but it should be ignored
+                "engagement": 1,
+                # These names resolve to Product 2's Engagement 4 -> Test 4
+                "product_name": "Security How-to",
+                "engagement_name": "April monthly engagement",
+                "version": "1.0.0",
+            }
+            response = self.client.post(self.url, payload)
+            self.assertEqual(403, response.status_code, response.content[:1000])
+            # Permission must be checked on name-resolved Test 4 (in Engagement 4),
+            # NOT on Test 3 (which belongs to the engagement=1 param)
+            mock.assert_called_with(User.objects.get(username="admin"),
+                Test.objects.get(id=4),
+                Permissions.Import_Scan_Result)
+            importer_mock.assert_not_called()
+            reimporter_mock.assert_not_called()
+
+    @patch("dojo.importers.default_reimporter.DefaultReImporter.process_scan")
+    @patch("dojo.importers.default_importer.DefaultImporter.process_scan")
+    def test_reimport_with_test_id_mismatched_product_name_is_rejected(self, importer_mock, reimporter_mock):
+        """Sending test ID from one product with product_name from another must be rejected."""
+        importer_mock.return_value = IMPORTER_MOCK_RETURN_VALUE
+        reimporter_mock.return_value = REIMPORTER_MOCK_RETURN_VALUE
+
+        with Path("tests/zap_sample.xml").open(encoding="utf-8") as testfile:
+            payload = {
+                "minimum_severity": "Low",
+                "active": True,
+                "verified": True,
+                "scan_type": "ZAP Scan",
+                "file": testfile,
+                # Test 3 belongs to Engagement 1 -> Product 2 ("Security How-to")
+                "test": 3,
+                # But product_name points to Product 1 ("Python How-to")
+                "product_name": "Python How-to",
+                "version": "1.0.0",
+            }
+            response = self.client.post(self.url, payload)
+            self.assertEqual(400, response.status_code, response.content[:1000])
+            importer_mock.assert_not_called()
+            reimporter_mock.assert_not_called()
+
+    @patch("dojo.importers.default_reimporter.DefaultReImporter.process_scan")
+    @patch("dojo.importers.default_importer.DefaultImporter.process_scan")
+    def test_reimport_with_test_id_mismatched_engagement_name_is_rejected(self, importer_mock, reimporter_mock):
+        """Sending test ID from one engagement with engagement_name from another must be rejected."""
+        importer_mock.return_value = IMPORTER_MOCK_RETURN_VALUE
+        reimporter_mock.return_value = REIMPORTER_MOCK_RETURN_VALUE
+
+        with Path("tests/zap_sample.xml").open(encoding="utf-8") as testfile:
+            payload = {
+                "minimum_severity": "Low",
+                "active": True,
+                "verified": True,
+                "scan_type": "ZAP Scan",
+                "file": testfile,
+                # Test 3 belongs to Engagement 1 ("1st Quarter Engagement")
+                "test": 3,
+                # But engagement_name points to a different engagement
+                "product_name": "Security How-to",
+                "engagement_name": "April monthly engagement",
+                "version": "1.0.0",
+            }
+            response = self.client.post(self.url, payload)
+            self.assertEqual(400, response.status_code, response.content[:1000])
+            importer_mock.assert_not_called()
+            reimporter_mock.assert_not_called()
+
 
 @versioned_fixtures
 class ProductTypeTest(BaseClass.BaseClassTest):
@@ -3953,6 +4210,33 @@ class ImportLanguagesTest(BaseClass.BaseClassTest):
                     self.assertEqual(counts["blank"], language.blank)
                     self.assertEqual(counts["comment"], language.comment)
                     self.assertEqual(counts["code"], language.code)
+
+    def test_create_with_invalid_json(self):
+        """Invalid file content should return 400, not 500."""
+        self.payload = {
+            "product": 1,
+            "file": SimpleUploadedFile(
+                "bad.json",
+                b"this is not json",
+                content_type="application/json",
+            ),
+        }
+        response = self.client.post(self.url, self.payload)
+        self.assertEqual(400, response.status_code)
+
+    def test_create_idempotent(self):
+        """Importing the same file twice should succeed and produce identical results."""
+        base_data = json.loads(
+            Path("unittests/files/defectdojo_cloc.json").read_text(encoding="utf-8"),
+        )
+        for _ in range(2):
+            self.payload = self._build_payload(base_data)
+            response = self.client.post(self.url, self.payload)
+            self.assertEqual(201, response.status_code, response.content[:1000])
+
+        languages = Languages.objects.filter(product=1)
+        # Should have exactly 2 languages (JSON and Python from the test file)
+        self.assertEqual(2, languages.count())
 
 
 @versioned_fixtures

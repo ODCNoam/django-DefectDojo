@@ -1,98 +1,31 @@
 import logging
-from datetime import timedelta
 
 import pghistory
 from celery import Task
 from celery.utils.log import get_task_logger
 from django.apps import apps
 from django.conf import settings
+from django.core.exceptions import SuspiciousOperation
 from django.core.management import call_command
 from django.db.models import Count, Prefetch
-from django.urls import reverse
-from django.utils import timezone
 
 from dojo.auditlog import run_flush_auditlog
 from dojo.celery import app
 from dojo.celery_dispatch import dojo_dispatch_task
 from dojo.finding.helper import fix_loop_duplicates
-from dojo.location.models import Location
 from dojo.management.commands.jira_status_reconciliation import jira_status_reconciliation
-from dojo.models import Alerts, Announcement, Endpoint, Engagement, Finding, Product, System_Settings, User
-from dojo.notifications.helper import create_notification
-from dojo.utils import calculate_grade, sla_compute_and_notify
+from dojo.models import Finding, System_Settings
+from dojo.utils import calculate_grade
 
 logger = get_task_logger(__name__)
 deduplicationLogger = logging.getLogger("dojo.specific-loggers.deduplication")
 
 
-# Logs the error to the alerts table, which appears in the notification toolbar
-def log_generic_alert(source, title, description):
-    create_notification(event="other", title=title, description=description,
-                        icon="bullseye", source=source)
-
-
-@app.task(bind=True)
-def add_alerts(self, runinterval, *args, **kwargs):
-    now = timezone.now()
-
-    upcoming_engagements = Engagement.objects.filter(target_start__gt=now + timedelta(days=3), target_start__lt=now + timedelta(days=3) + runinterval).order_by("target_start")
-    for engagement in upcoming_engagements:
-        create_notification(event="upcoming_engagement",
-                            title=f"Upcoming engagement: {engagement.name}",
-                            engagement=engagement,
-                            recipients=[engagement.lead],
-                            url=reverse("view_engagement", args=(engagement.id,)))
-
-    stale_engagements = Engagement.objects.filter(
-        target_start__gt=now - runinterval,
-        target_end__lt=now,
-        status="In Progress").order_by("-target_end")
-    for eng in stale_engagements:
-        create_notification(event="stale_engagement",
-                            title=f"Stale Engagement: {eng.name}",
-                            description='The engagement "{}" is stale. Target end was {}.'.format(eng.name, eng.target_end.strftime("%b. %d, %Y")),
-                            url=reverse("view_engagement", args=(eng.id,)),
-                            recipients=[eng.lead])
-
-    system_settings = System_Settings.objects.get()
-    if system_settings.engagement_auto_close:
-        # Close Engagements older than user defined days
-        close_days = system_settings.engagement_auto_close_days
-        unclosed_engagements = Engagement.objects.filter(target_end__lte=now - timedelta(days=close_days),
-                                                        status="In Progress").order_by("target_end")
-
-        for eng in unclosed_engagements:
-            create_notification(event="auto_close_engagement",
-                                title=eng.name,
-                                description='The engagement "{}" has auto-closed. Target end was {}.'.format(eng.name, eng.target_end.strftime("%b. %d, %Y")),
-                                url=reverse("view_engagement", args=(eng.id,)),
-                                recipients=[eng.lead])
-
-        unclosed_engagements.update(status="Completed", active=False, updated=timezone.now())
-
-    # Calculate grade
-    if system_settings.enable_product_grade:
-        products = Product.objects.all()
-        for product in products:
-            dojo_dispatch_task(calculate_grade, product.id)
-
-
-@app.task(bind=True)
-def cleanup_alerts(*args, **kwargs):
-    try:
-        max_alerts_per_user = settings.MAX_ALERTS_PER_USER
-    except System_Settings.DoesNotExist:
-        max_alerts_per_user = -1
-
-    if max_alerts_per_user > -1:
-        total_deleted_count = 0
-        logger.info("start deleting oldest alerts if a user has more than %s alerts", max_alerts_per_user)
-        users = User.objects.all()
-        for user in users:
-            alerts_to_delete = Alerts.objects.filter(user_id=user.id).order_by("-created")[max_alerts_per_user:].values_list("id", flat=True)
-            total_deleted_count += len(alerts_to_delete)
-            Alerts.objects.filter(pk__in=list(alerts_to_delete)).delete()
-        logger.info("total number of alerts deleted: %s", total_deleted_count)
+from dojo.notifications.tasks import (  # noqa: E402, F401  -- backward compat
+    add_alerts,
+    cleanup_alerts,
+    log_generic_alert,
+)
 
 
 @app.task(bind=True)
@@ -138,8 +71,11 @@ def _async_dupe_delete_impl():
         originals_with_too_many_duplicates = Finding.objects.filter(id__in=originals_with_too_many_duplicates_ids).order_by("id")
 
         # prefetch to make it faster
+        # Oldest-first: delete from the front of the list until dupe_count <= 0, keeping the last max_dupes.
+        # order_by("date") alone leaves ties undefined when many duplicates share the same date (e.g. tool date);
+        # add id so we always drop lower-id (older) rows first and retain higher-id (newer) imports.
         originals_with_too_many_duplicates = originals_with_too_many_duplicates.prefetch_related(Prefetch("original_finding",
-            queryset=Finding.objects.filter(duplicate=True).order_by("date")))
+            queryset=Finding.objects.filter(duplicate=True).order_by("date", "id")))
 
         total_deleted_count = 0
         affected_products = set()
@@ -186,19 +122,14 @@ def celery_status():
     return True
 
 
-@app.task
-def async_sla_compute_and_notify_task(*args, **kwargs):
-    logger.debug("Computing SLAs and notifying as needed")
-    try:
-        system_settings = System_Settings.objects.get()
-        if system_settings.enable_finding_sla:
-            sla_compute_and_notify(*args, **kwargs)
-    except Exception:
-        logger.exception("An unexpected error was thrown calling the SLA code")
+from dojo.notifications.tasks import async_sla_compute_and_notify_task  # noqa: E402, F401  -- backward compat
 
 
 @app.task
 def jira_status_reconciliation_task(*args, **kwargs):
+    if jira_status_reconciliation is None:
+        logger.warning("Jira status reconciliation is not available")
+        return None
     # Wrap with pghistory context for audit trail
     with pghistory.context(
         source="jira_reconciliation",
@@ -212,37 +143,6 @@ def fix_loop_duplicates_task(*args, **kwargs):
     # Wrap with pghistory context for audit trail
     with pghistory.context(source="fix_loop_duplicates"):
         return fix_loop_duplicates()
-
-
-@app.task
-def evaluate_pro_proposition(*args, **kwargs):
-    # Ensure we should be doing this
-    if not settings.CREATE_CLOUD_BANNER:
-        return
-    # Get the announcement object
-    announcement = Announcement.objects.get_or_create(id=1)[0]
-    # Quick check for a user has modified the current banner - if not, exit early as we dont want to stomp
-    if not any(
-        entry in announcement.message
-        for entry in [
-            "",
-            "DefectDojo Pro Cloud and On-Premise Subscriptions Now Available!",
-            "Findings/Endpoints in their systems",
-        ]
-    ):
-        return
-    # Count the objects the determine if the banner should be updated
-    if settings.V3_FEATURE_LOCATIONS:
-        object_count = Finding.objects.count() + Location.objects.count()
-    else:
-        # TODO: Delete this after the move to Locations
-        object_count = Finding.objects.count() + Endpoint.objects.count()
-    # Unless the count is greater than 100k, exit early
-    if object_count < 100000:
-        return
-    # Update the announcement
-    announcement.message = f'Only professionals have {object_count:,} Findings and Endpoints in their systems... <a href="https://www.defectdojo.com/pricing" target="_blank">Get DefectDojo Pro</a> today!'
-    announcement.save()
 
 
 @app.task
@@ -290,7 +190,37 @@ def update_watson_search_index_for_model(model_name, pk_list, *args, **kwargs):
                 continue
 
         # Let watson handle the bulk indexing
-        context_manager.end()
+        try:
+            context_manager.end()
+        except SuspiciousOperation:
+            # Some finding content (e.g. a very long tag-like string) triggered
+            # Django's strip_tags SuspiciousOperation guard.  Fall back to
+            # per-instance indexing so we can skip the offending object(s)
+            # instead of silently dropping the entire batch.
+            # https://www.djangoproject.com/weblog/2025/may/07/security-releases/
+            # https://github.com/DefectDojo/django-DefectDojo/issues/14649
+            logger.warning(
+                f"Batch watson index update for {model_name} hit SuspiciousOperation; "
+                "falling back to per-instance indexing",
+            )
+            instances_added = 0
+            instances_skipped = 0
+            for instance in instances:
+                single_ctx = SearchContextManager()
+                single_ctx.start()
+                try:
+                    single_ctx.add_to_context(engine, instance)
+                    single_ctx.end()
+                    instances_added += 1
+                except SuspiciousOperation:
+                    logger.warning(
+                        f"Skipping watson index update for {model_name}:{instance.pk} "
+                        "— content triggered SuspiciousOperation in strip_tags",
+                    )
+                    instances_skipped += 1
+                except Exception as e:
+                    logger.warning(f"Skipping watson index update for {model_name}:{instance.pk} - {e}")
+                    instances_skipped += 1
 
         logger.debug(f"Completed async watson index update: {instances_added} updated, {instances_skipped} skipped")
 
