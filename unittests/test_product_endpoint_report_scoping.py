@@ -3,6 +3,7 @@ from django.utils.timezone import now
 
 from dojo.authorization.roles_permissions import Roles
 from dojo.models import (
+    Dojo_User,
     Endpoint,
     Endpoint_Status,
     Engagement,
@@ -67,6 +68,10 @@ class TestProductEndpointReportScoping(DojoTestCase):
             product=cls.product_a,
             role=reader_role,
         )
+        # Legacy authorization collapses Reader/Writer/Maintainer/Owner into
+        # a single ``authorized_users`` membership; mirror the RBAC row so
+        # the user is visible to ``get_authorized_*`` queries.
+        cls.product_a.authorized_users.add(Dojo_User.objects.get(pk=cls.restricted_user.pk))
 
     @classmethod
     def _create_finding_with_endpoint(cls, product, title, description, *, host):
@@ -119,7 +124,7 @@ class TestProductEndpointReportScoping(DojoTestCase):
         self.client.force_login(self.user)
 
     def test_product_endpoint_report_only_includes_target_product_findings(self):
-        url = f"/product/{self.product_a.id}/endpoint/report?_generate=1&report_type=HTML"
+        url = f"/asset/{self.product_a.id}/endpoint/report?_generate=1&report_type=HTML"
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200, response.content[:500])
         body = response.content.decode()
@@ -132,7 +137,7 @@ class TestProductEndpointReportScoping(DojoTestCase):
         )
 
     def test_product_b_report_only_includes_product_b_findings(self):
-        url = f"/product/{self.product_b.id}/endpoint/report?_generate=1&report_type=HTML"
+        url = f"/asset/{self.product_b.id}/endpoint/report?_generate=1&report_type=HTML"
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200, response.content[:500])
         body = response.content.decode()

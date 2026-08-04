@@ -12,13 +12,16 @@ from dojo.importers.base_location_manager import LocationHandler
 from dojo.importers.options import ImporterOptions
 from dojo.jira import services as jira_services
 from dojo.models import (
+    DEDUPLICATION_EXECUTION_MODE_ASYNC_WAIT,
     Engagement,
     Finding,
     Test,
     Test_Import,
 )
 from dojo.notifications.helper import async_create_notification
-from dojo.tag_utils import bulk_apply_parser_tags
+from dojo.tags import inheritance as tag_inheritance
+from dojo.tags.inheritance import apply_inherited_tags_for_findings
+from dojo.tags.utils import bulk_apply_parser_tags
 from dojo.utils import get_full_url, perform_product_grading
 from dojo.validators import clean_tags
 
@@ -123,8 +126,8 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
         # Update the test meta
         self.update_test_meta()
         # Save the test and engagement for changes to take affect
-        self.test.save()
-        self.test.engagement.save()
+        self.save_without_resurrecting(self.test)
+        self.save_without_resurrecting(self.test.engagement)
         # Create a test import history object to record the flags sent to the importer
         # This operation will return None if the user does not have the import history
         # feature enabled
@@ -132,11 +135,10 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
             new_findings=new_findings,
             closed_findings=closed_findings,
         )
-        # Apply tags to findings and endpoints/locations
-        self.apply_import_tags(
-            new_findings=new_findings,
-            closed_findings=closed_findings,
-        )
+        # In 'async_wait' mode, block until background deduplication has finished
+        # so notifications and statistics reflect the deduplicated state.
+        self.wait_for_post_processing()
+
         # Send out some notifications to the user
         logger.debug("IMPORT_SCAN: Generating notifications")
         dojo_dispatch_task(
@@ -167,8 +169,26 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
         parsed_findings: list[Finding],
         **kwargs: dict,
     ) -> list[Finding]:
-        # Batched post-processing (no chord): dispatch a task per 1000 findings or on final finding
-        batch_finding_ids: list[int] = []
+        # Whole hot loop runs under `batch_mode()`: per-row inheritance signals
+        # for the findings/endpoints/locations created below are suppressed.
+        # Inheritance is then applied in bulk per-batch (right before
+        # `post_process_findings_batch` dispatch) so rules/dedup see inherited
+        # tags on `finding.tags`.
+        with tag_inheritance.suppress_tag_inheritance():
+            return self._process_findings_internal(parsed_findings, **kwargs)
+
+    def _process_findings_internal(
+        self,
+        parsed_findings: list[Finding],
+        **kwargs: dict,
+    ) -> list[Finding]:
+        # Batched post-processing (no chord): dispatch a task per 1000 findings or on final finding.
+        # Each entry carries the finding's own push_to_jira flag: grouped findings are pushed to
+        # JIRA as a group after the loop, so their individual push is suppressed while ungrouped
+        # findings in the same batch must still be pushed. The batch is partitioned by flag at
+        # dispatch time instead of applying one finding's flag to the whole batch.
+        batch_finding_ids: list[tuple[int, bool]] = []
+        batch_findings: list[Finding] = []
         batch_max_size = getattr(settings, "IMPORT_REIMPORT_DEDUPE_BATCH_SIZE", 1000)
 
         """
@@ -258,29 +278,50 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
                          self.push_to_jira, self.findings_groups_enabled, self.group_by)
             push_to_jira = self.push_to_jira and ((not self.findings_groups_enabled or not self.group_by) or not finding_will_be_grouped)
             logger.debug("process_findings: computed push_to_jira=%s", push_to_jira)
-            batch_finding_ids.append(finding.id)
+            batch_finding_ids.append((finding.id, push_to_jira))
+            batch_findings.append(finding)
 
             # If batch is full or we're at the end, persist locations/endpoints and dispatch
             if len(batch_finding_ids) >= batch_max_size or is_final_finding:
                 self.location_handler.persist()
+                self.flush_vulnerability_ids()
+                self.flush_burp_request_response()
                 # Apply parser-supplied tags for this batch before post-processing starts,
                 # so rules/deduplication tasks see the tags already on the findings.
                 bulk_apply_parser_tags(findings_with_parser_tags)
                 findings_with_parser_tags.clear()
-                finding_ids_batch = list(batch_finding_ids)
+                # Apply import-time tags before post-processing so rules/deduplication see them.
+                self.apply_import_tags_for_batch(batch_findings)
+                # Apply inherited Product tags to this batch's findings (and
+                # their endpoints/locations) BEFORE post_process_findings_batch
+                # dispatches, so rules/dedup see inherited tags on .tags.
+                apply_inherited_tags_for_findings(batch_findings)
+                batch_findings.clear()
+                # Partition the batch by each finding's own push_to_jira flag so one
+                # finding's grouping state is not applied to the whole batch. Uniform
+                # batches (grouping disabled, or push_to_jira off) stay a single dispatch.
+                finding_ids_by_push: dict[bool, list[int]] = {}
+                for finding_id, finding_push_to_jira in batch_finding_ids:
+                    finding_ids_by_push.setdefault(finding_push_to_jira, []).append(finding_id)
                 batch_finding_ids.clear()
-                logger.debug("process_findings: dispatching batch with push_to_jira=%s (batch_size=%d, is_final=%s)",
-                             push_to_jira, len(finding_ids_batch), is_final_finding)
-                dojo_dispatch_task(
-                    finding_helper.post_process_findings_batch,
-                    finding_ids_batch,
-                    dedupe_option=True,
-                    rules_option=True,
-                    product_grading_option=True,
-                    issue_updater_option=True,
-                    push_to_jira=push_to_jira,
-                    sync=kwargs.get("sync", False),
-                )
+                for push_to_jira_batch, finding_ids_batch in finding_ids_by_push.items():
+                    logger.debug("process_findings: dispatching batch with push_to_jira=%s (batch_size=%d, is_final=%s)",
+                                 push_to_jira_batch, len(finding_ids_batch), is_final_finding)
+                    result = dojo_dispatch_task(
+                        finding_helper.post_process_findings_batch,
+                        finding_ids_batch,
+                        dedupe_option=True,
+                        rules_option=True,
+                        product_grading_option=True,
+                        issue_updater_option=True,
+                        push_to_jira=push_to_jira_batch,
+                        # 'async_wait' joins on this dispatch via AsyncResult.get(), so its
+                        # result must be stored despite the global CELERY_TASK_IGNORE_RESULT.
+                        **({"ignore_result": False} if self.deduplication_execution_mode == DEDUPLICATION_EXECUTION_MODE_ASYNC_WAIT else {}),
+                        **self.post_processing_dispatch_kwargs(**kwargs),
+                    )
+                    if self.deduplication_execution_mode == DEDUPLICATION_EXECUTION_MODE_ASYNC_WAIT:
+                        self.record_post_processing_result(result)
 
             # No chord: tasks are dispatched immediately above per batch
 
@@ -371,7 +412,7 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
         # Remove all the findings that are coming from the report already mitigated
         new_hash_codes = []
         new_unique_ids_from_tool = []
-        for finding in findings.values():
+        for finding in findings.values("is_mitigated", "hash_code", "unique_id_from_tool"):
             # Do not process closed findings in the report
             if finding.get("is_mitigated", False):
                 continue
@@ -396,6 +437,7 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
             )
         # Persist any accumulated location/endpoint status changes
         self.location_handler.persist()
+        self.flush_vulnerability_ids()
         # push finding groups to jira since we only only want to push whole groups
         # We dont check if the finding jira sync is applicable quite yet until we can get in the loop
         # but this is a way to at least make it that far

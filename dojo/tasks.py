@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 
 import pghistory
 from celery import Task
@@ -7,12 +8,13 @@ from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import SuspiciousOperation
 from django.core.management import call_command
-from django.db.models import Count, Prefetch
+from django.db.models import Count, IntegerField, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce
 
 from dojo.auditlog import run_flush_auditlog
 from dojo.celery import app
 from dojo.celery_dispatch import dojo_dispatch_task
-from dojo.finding.helper import fix_loop_duplicates
+from dojo.finding.helper import bulk_delete_findings, fix_loop_duplicates
 from dojo.management.commands.jira_status_reconciliation import jira_status_reconciliation
 from dojo.models import Finding, System_Settings
 from dojo.utils import calculate_grade
@@ -40,6 +42,74 @@ def async_dupe_delete(*args, **kwargs):
         _async_dupe_delete_impl()
 
 
+def _repoint_chained_duplicates(ids_to_delete):
+    """
+    Break inbound duplicate_finding references from findings that survive this run.
+
+    Chained duplicates (A -> B -> C, from past bugs or high parallel load - see
+    fix_loop_duplicates) can leave a SURVIVING finding pointing at an excess duplicate
+    that is about to be deleted. The duplicate_finding self-FK is ON DELETE DO_NOTHING,
+    so deleting while such references exist raises IntegrityError, rolls the chunk
+    back, and the task retries forever without ever making progress (observed in
+    production: the same finding id failing every run).
+
+    Survivors are re-pointed at their chain's root outside the delete set; when the
+    chain dead-ends or loops inside the delete set they are promoted to originals,
+    mirroring how fix_loop_duplicates handles parentless duplicates.
+    """
+    delete_set = set(ids_to_delete)
+
+    # Each deleted finding's own parent lets us walk chains that pass through the
+    # delete set: id -> duplicate_finding_id.
+    parent_of_deleted = dict(
+        Finding.objects.filter(id__in=delete_set).values_list("id", "duplicate_finding_id"),
+    )
+
+    def resolve_surviving_root(start_id):
+        seen = set()
+        current = start_id
+        while current in parent_of_deleted:
+            if current in seen:
+                # Defensive: a reference loop entirely inside the delete set.
+                return None
+            seen.add(current)
+            current = parent_of_deleted[current]
+        return current  # A surviving finding id, or None when the chain dead-ends.
+
+    survivors = (
+        Finding.objects
+        .filter(duplicate_finding_id__in=delete_set)
+        .exclude(id__in=delete_set)
+        .values_list("id", "duplicate_finding_id")
+    )
+
+    repoint_groups = defaultdict(list)  # surviving root id -> [survivor ids]
+    promote_ids = []
+
+    for survivor_id, parent_id in survivors:
+        root_id = resolve_surviving_root(parent_id)
+        if root_id is None or root_id == survivor_id:
+            # No surviving root (or the chain circles back to the survivor
+            # itself): promote to original rather than fabricate a self-loop.
+            promote_ids.append(survivor_id)
+        else:
+            repoint_groups[root_id].append(survivor_id)
+
+    if not repoint_groups and not promote_ids:
+        return
+
+    deduplicationLogger.warning(
+        "dupe delete: re-pointing %d chained duplicate reference(s) (promoting %d to original) before deleting %d findings",
+        sum(len(ids) for ids in repoint_groups.values()), len(promote_ids), len(delete_set),
+    )
+
+    for root_id, survivor_ids in repoint_groups.items():
+        Finding.objects.filter(id__in=survivor_ids).update(duplicate_finding_id=root_id)
+
+    if promote_ids:
+        Finding.objects.filter(id__in=promote_ids).update(duplicate_finding=None, duplicate=False)
+
+
 def _async_dupe_delete_impl():
     """Internal implementation of async_dupe_delete within pghistory context."""
     try:
@@ -54,60 +124,81 @@ def _async_dupe_delete_impl():
         logger.info("skipping deletion of excess duplicates: max_dupes not configured")
         return
 
-    if enabled:
-        logger.info("delete excess duplicates (max_dupes per finding: %s, max deletes per run: %s)", dupe_max, total_duplicate_delete_count_max_per_run)
-        deduplicationLogger.info("delete excess duplicates (max_dupes per finding: %s, max deletes per run: %s)", dupe_max, total_duplicate_delete_count_max_per_run)
+    if not enabled:
+        return
 
-        # limit to settings.DUPE_DELETE_MAX_PER_RUN to prevent overlapping jobs
-        results = Finding.objects \
-                .filter(duplicate=True) \
-                .order_by() \
-                .values("duplicate_finding") \
-                .annotate(num_dupes=Count("id")) \
-                .filter(num_dupes__gt=dupe_max)[:total_duplicate_delete_count_max_per_run]
+    logger.info("delete excess duplicates (max_dupes per finding: %s, max deletes per run: %s)", dupe_max, total_duplicate_delete_count_max_per_run)
+    deduplicationLogger.info("delete excess duplicates (max_dupes per finding: %s, max deletes per run: %s)", dupe_max, total_duplicate_delete_count_max_per_run)
 
-        originals_with_too_many_duplicates_ids = [result["duplicate_finding"] for result in results]
+    # Originals that currently have more duplicates than dupe_max allows.
+    originals_with_excess = (
+        Finding.objects
+        .filter(duplicate=True)
+        .order_by()
+        .values("duplicate_finding")
+        .annotate(num_dupes=Count("id"))
+        .filter(num_dupes__gt=dupe_max)
+        .values("duplicate_finding")
+    )
 
-        originals_with_too_many_duplicates = Finding.objects.filter(id__in=originals_with_too_many_duplicates_ids).order_by("id")
+    # For each candidate duplicate, count siblings of the same original that are strictly newer
+    # (later date, or same date but higher id — matches the keep-newest ordering).
+    # A finding is excess when >= dupe_max newer siblings exist: it falls outside the kept window.
+    # Coalesce(..., 0) handles the no-newer-siblings case (subquery returns NULL via empty GROUP BY).
+    newer_siblings_subq = Subquery(
+        Finding.objects
+        .filter(
+            duplicate=True,
+            duplicate_finding_id=OuterRef("duplicate_finding_id"),
+        )
+        .filter(
+            Q(date__gt=OuterRef("date")) | Q(date=OuterRef("date"), id__gt=OuterRef("id")),
+        )
+        .order_by()
+        .values("duplicate_finding_id")
+        .annotate(cnt=Count("id"))
+        .values("cnt"),
+        output_field=IntegerField(),
+    )
 
-        # prefetch to make it faster
-        # Oldest-first: delete from the front of the list until dupe_count <= 0, keeping the last max_dupes.
-        # order_by("date") alone leaves ties undefined when many duplicates share the same date (e.g. tool date);
-        # add id so we always drop lower-id (older) rows first and retain higher-id (newer) imports.
-        originals_with_too_many_duplicates = originals_with_too_many_duplicates.prefetch_related(Prefetch("original_finding",
-            queryset=Finding.objects.filter(duplicate=True).order_by("date", "id")))
+    # Single query: excess (oldest) duplicates, newest-first within each original group.
+    # select_related avoids N+1 queries when collecting affected products below.
+    # only() limits Finding columns fetched; test_id is required for the select_related join.
+    excess_dupes = (
+        Finding.objects
+        .filter(duplicate=True, duplicate_finding__in=originals_with_excess)
+        .annotate(newer_cnt=Coalesce(newer_siblings_subq, 0))
+        .filter(newer_cnt__gte=dupe_max)
+        .select_related("test__engagement__product")
+        .only("id", "test_id")
+        .order_by("id")
+        [:total_duplicate_delete_count_max_per_run]
+    )
 
-        total_deleted_count = 0
-        affected_products = set()
-        for original in originals_with_too_many_duplicates:
-            duplicate_list = original.original_finding.all()
-            dupe_count = len(duplicate_list) - dupe_max
+    ids_to_delete = []
+    affected_products = set()
+    for finding in excess_dupes:
+        ids_to_delete.append(finding.id)
+        affected_products.add(finding.test.engagement.product)
 
-            for finding in duplicate_list:
-                deduplicationLogger.debug(f"deleting finding {finding.id}:{finding.title} ({finding.hash_code}))")
-                # Collect the product for batch grading later
-                affected_products.add(finding.test.engagement.product)
-                # Skip individual product grading during deletion
-                finding.delete(product_grading_option=False)
-                total_deleted_count += 1
-                dupe_count -= 1
-                if dupe_count <= 0:
-                    break
-                if total_deleted_count >= total_duplicate_delete_count_max_per_run:
-                    break
+    logger.info("total number of excess duplicates to delete: %s", len(ids_to_delete))
 
-            if total_deleted_count >= total_duplicate_delete_count_max_per_run:
-                break
+    if ids_to_delete:
+        _repoint_chained_duplicates(ids_to_delete)
 
-        logger.info("total number of excess duplicates deleted: %s", total_deleted_count)
+        # order_desc=True deletes higher ids before lower ids, consistent with how
+        # finding_delete handles duplicate clusters (duplicate_cluster.order_by("-id").delete()).
+        bulk_delete_findings(Finding.objects.filter(id__in=ids_to_delete), order_desc=True)
 
-        # Batch product grading for all affected products
-        if affected_products:
-            system_settings = System_Settings.objects.get()
-            if system_settings.enable_product_grade:
-                logger.info("performing batch product grading for %s products", len(affected_products))
-                for product in affected_products:
-                    dojo_dispatch_task(calculate_grade, product.id)
+    logger.info("total number of excess duplicates deleted: %s", len(ids_to_delete))
+
+    # Batch product grading for all affected products
+    if affected_products:
+        system_settings = System_Settings.objects.get()
+        if system_settings.enable_product_grade:
+            logger.info("performing batch product grading for %s products", len(affected_products))
+            for product in affected_products:
+                dojo_dispatch_task(calculate_grade, product.id)
 
 
 @app.task(ignore_result=False, base=Task)
@@ -162,6 +253,8 @@ def update_watson_search_index_for_model(model_name, pk_list, *args, **kwargs):
     """
     from watson.search import SearchContextManager, default_search_engine  # noqa: PLC0415 circular import
 
+    from dojo.utils_watson_prefetch import build_indexing_queryset  # noqa: PLC0415 circular import
+
     logger.debug(f"Starting async watson index update for {len(pk_list)} {model_name} instances")
 
     try:
@@ -174,11 +267,19 @@ def update_watson_search_index_for_model(model_name, pk_list, *args, **kwargs):
         app_label, model_name = model_name.split(".")
         model_class = apps.get_model(app_label, model_name)
 
-        # Bulk load instances and add them to the context
-        instances = model_class.objects.filter(pk__in=pk_list)
+        # Bulk load instances and add them to the context. The queryset auto-derives
+        # select_related/prefetch_related from the adapter's fields/store paths to
+        # avoid N+1 queries during indexing. Disable via DD_WATSON_INDEX_PREFETCH_ENABLED=False.
+        adapter = engine.get_adapter(model_class)
+        instances = build_indexing_queryset(model_class, pk_list, adapter)
         instances_added = 0
         instances_skipped = 0
 
+        # This task IS the terminal drain: it accumulates one already-bounded batch (<= 1000
+        # PKs) into its own local SearchContextManager and bulk-saves it once via end(). The
+        # intermediate size-flush hook is bound to the global singleton instance only, so
+        # this private context keeps the stock add_to_context, never re-triggers the flush,
+        # and cannot re-dispatch itself.
         for instance in instances:
             try:
                 # Add to watson context (this will trigger indexing on end())
